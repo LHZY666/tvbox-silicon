@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TARGET_SHA: 08fc93969eb2d8c58b053e4bed1e76975c674164
+  TARGET_SHA: 3ffd45ae4cadba6aa42327ff7b0f44141cd32568
   DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
   JOBS: '2'
   HOMEBREW_NO_AUTO_UPDATE: '1'
