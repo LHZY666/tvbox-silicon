@@ -5,6 +5,10 @@ import FoundationNetworking
 
 /// Looks up opening and ending markers independently: the first valid answer for each kind wins.
 public enum PlaybackSkipLookup {
+    /// The viewer's opt-in (Settings): off unless turned on, since each lookup tells three outside services what is
+    /// playing (#2653).
+    public static let enabledKey = "player.onlineSkipMarkers"
+    public static var enabled: Bool { UserDefaults.standard.bool(forKey: enabledKey) }
     public struct Media: Hashable, Sendable {
         public let tmdbID: Int?
         public let imdbID: String?
@@ -27,19 +31,49 @@ public enum PlaybackSkipLookup {
     /// The duration must be known. Cancel the consuming task when the playing media changes.
     /// Each snapshot includes every marker already accepted, even if the other kind arrived later.
     /// A 15-second total deadline ends the stream even if a provider keeps sending data.
-    public static func lookup(_ media: Media, session: URLSession = .shared) -> AsyncStream<[PlaybackSkip]> {
-        lookup(media, transport: { try await session.data(for: $0) })
+    public static func lookup(_ media: Media, session: URLSession = .shared) -> AsyncStream<Snapshot> {
+        snapshots(media, transport: { try await session.data(for: $0) })
     }
 
-    enum Provider: CaseIterable, Equatable, Sendable { case theOtherDB, theIntroDB, introDB }
-    typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
-    private enum Event: Sendable { case response([PlaybackSkip]), deadline }
+    /// The markers accepted so far, and the service each kind came from ("TheIntroDB"), to say so where they show.
+    public struct Snapshot: Equatable, Sendable {
+        public var skips: [PlaybackSkip]
+        public var introSource: String?
+        public var outroSource: String?
+        public init(skips: [PlaybackSkip] = [], introSource: String? = nil, outroSource: String? = nil) {
+            self.skips = skips; self.introSource = introSource; self.outroSource = outroSource
+        }
+    }
 
-    /// Injecting the transport and deadline keeps request contracts and completion races testable.
+    enum Provider: CaseIterable, Equatable, Sendable {
+        case theOtherDB, theIntroDB, introDB
+        var name: String {
+            switch self { case .theOtherDB: "TheOtherDB"; case .theIntroDB: "TheIntroDB"; case .introDB: "IntroDB" }
+        }
+    }
+    typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+    private enum Event: Sendable { case response(Provider?, [PlaybackSkip]), deadline }
+
+    /// The markers alone, as `snapshots` streams them.
     static func lookup(_ media: Media, transport: @escaping Transport,
                        waitForDeadline: @escaping @Sendable () async throws -> Void = {
                            try await Task.sleep(for: .seconds(15))
                        }) -> AsyncStream<[PlaybackSkip]> {
+        let inner = snapshots(media, transport: transport, waitForDeadline: waitForDeadline)
+        return AsyncStream { continuation in
+            let relay = Task {
+                for await snapshot in inner { continuation.yield(snapshot.skips) }
+                continuation.finish()
+            }
+            continuation.onTermination = { @Sendable _ in relay.cancel() }
+        }
+    }
+
+    /// Injecting the transport and deadline keeps request contracts and completion races testable.
+    static func snapshots(_ media: Media, transport: @escaping Transport,
+                          waitForDeadline: @escaping @Sendable () async throws -> Void = {
+                              try await Task.sleep(for: .seconds(15))
+                          }) -> AsyncStream<Snapshot> {
         let requests = Provider.allCases.compactMap { provider in
             request(for: provider, media: media).map { (provider, $0) }
         }
@@ -56,33 +90,36 @@ public enum PlaybackSkipLookup {
                     }
                     for (provider, request) in requests {
                         group.addTask {
-                            guard !Task.isCancelled else { return .response([]) }
+                            guard !Task.isCancelled else { return .response(nil, []) }
                             do {
                                 let (data, response) = try await transport(request)
                                 guard !Task.isCancelled, let http = response as? HTTPURLResponse,
-                                      (200..<300).contains(http.statusCode) else { return .response([]) }
-                                return .response(parse(data, from: provider, duration: media.duration))
+                                      (200..<300).contains(http.statusCode) else { return .response(nil, []) }
+                                return .response(provider, parse(data, from: provider, duration: media.duration))
                             } catch {
                                 // No-data, HTTP failures and one provider's own cancellation are local.
-                                return .response([])
+                                return .response(nil, [])
                             }
                         }
                     }
                     var intro: [PlaybackSkip]?, outro: [PlaybackSkip]?
+                    var introSource: String?, outroSource: String?
                     var remaining = requests.count
                     for await event in group {
-                        guard !Task.isCancelled, case .response(let segments) = event else { return }
+                        guard !Task.isCancelled, case .response(let provider, let segments) = event else { return }
                         remaining -= 1
                         var changed = false
                         if intro == nil {
                             let found = segments.filter { $0.kind == .intro }
-                            if !found.isEmpty { intro = found; changed = true }
+                            if !found.isEmpty { intro = found; introSource = provider?.name; changed = true }
                         }
                         if outro == nil {
                             let found = segments.filter { $0.kind == .outro }
-                            if !found.isEmpty { outro = found; changed = true }
+                            if !found.isEmpty { outro = found; outroSource = provider?.name; changed = true }
                         }
-                        if changed { continuation.yield((intro ?? []) + (outro ?? [])) }
+                        if changed {
+                            continuation.yield(Snapshot(skips: (intro ?? []) + (outro ?? []), introSource: introSource, outroSource: outroSource))
+                        }
                         if remaining == 0 || (intro != nil && outro != nil) { return }
                     }
                 }
@@ -179,10 +216,10 @@ public enum PlaybackSkipLookup {
             var best: (distance: Double, segments: [PlaybackSkip])?
             for item in root["items"]?.array ?? [] {
                 guard let item = item.object, let runtime = number(item["version_runtime"]), runtime > 0 else { continue }
-                // Reject a different cut whose runtime is over five minutes away. This is a
-                // client matching limit, also used by TheIntroDB's duration matching contract.
+                // Reject a different cut whose runtime is over a minute away: the times of a version that long or
+                // short are the times of another cut.
                 let distance = abs(runtime - duration)
-                guard distance <= 300 else { continue }
+                guard distance <= 60 else { continue }
                 let found = (item["marker"]?.array ?? []).compactMap { value -> PlaybackSkip? in
                     guard let marker = value.object, case .string(let name) = marker["marker_type"],
                           let kind = markerKind(name), let start = number(marker["time_start"]),
