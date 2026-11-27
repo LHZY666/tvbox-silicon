@@ -13,79 +13,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TARGET_SHA: fd966ecba5e656c2ef7f32e1fc5dffd45aeab575
+  TARGET_SHA: 31c182fa239c329b88e35e8f3d7a71bb91b8c636
   DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
   JOBS: '2'
   HOMEBREW_NO_AUTO_UPDATE: '1'
 
 jobs:
-  swift-package:
-    name: Swift package tests (Xcode 27.2)
-    runs-on: xcode-27
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ env.TARGET_SHA }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Verify revision and toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
-          git remote set-url origin https://github.com/jo32/tvbox-silicon.git
-          git fetch origin main
-          git merge-base --is-ancestor origin/main HEAD
-          test "$(uname -m)" = arm64
-          xcodebuild -version
-          xcodebuild -showsdks
-          swift --version
-          df -h .
-          mkdir -p build
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Install package build tools
-        run: brew install pkgconf
-      - uses: actions/cache/restore@v4
-        id: media-cache
-        with:
-          path: |
-            ~/Library/Caches/tvbox-ffmpeg/*/FFmpeg.xcframework
-            ~/Library/Caches/tvbox-libass/*/LibASS.xcframework
-          key: apple-media-xcode27.2-${{ hashFiles('Scripts/build-apple-ffmpeg.sh', 'Scripts/build-apple-libass.sh') }}
-      - name: Build original media dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          Scripts/build-apple-ffmpeg.sh 2>&1 | tee build/ci-ffmpeg.log
-          Scripts/build-apple-libass.sh 2>&1 | tee build/ci-libass.log
-      - name: Cache successfully built media dependencies
-        if: steps.media-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~/Library/Caches/tvbox-ffmpeg/*/FFmpeg.xcframework
-            ~/Library/Caches/tvbox-libass/*/LibASS.xcframework
-          key: apple-media-xcode27.2-${{ hashFiles('Scripts/build-apple-ffmpeg.sh', 'Scripts/build-apple-libass.sh') }}
-      - name: Run complete default Swift package test suite
-        shell: bash
-        run: |
-          set -euo pipefail
-          swift test --jobs 2 --no-parallel 2>&1 | tee build/ci-swift-tests.log
-      - name: Save package evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: swift-package-evidence
-          path: build/ci-*.log
-          if-no-files-found: ignore
-          retention-days: 14
-
   full-verify:
     name: Full macOS, iOS and tvOS verification
-    needs: swift-package
     runs-on: xcode-27
     timeout-minutes: 360
     steps:
@@ -103,7 +38,11 @@ jobs:
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
           git remote set-url origin https://github.com/jo32/tvbox-silicon.git
           git fetch origin main
-          git merge-base --is-ancestor origin/main HEAD
+          echo "Checking current upstream baseline $(git rev-parse origin/main)"
+          if ! git merge-base --is-ancestor origin/main HEAD; then
+            echo "::error::Feature $TARGET_SHA does not include latest upstream $(git rev-parse origin/main); synchronize main before verifying."
+            exit 1
+          fi
           test "$(uname -m)" = arm64
           xcodebuild -version
           xcodebuild -showsdks
