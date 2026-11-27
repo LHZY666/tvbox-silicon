@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TARGET_SHA: 345b5d50fa393b8023d9f2bdad949a0d55b06781
+  TARGET_SHA: 016a702a82733110b052695d33bb670f92cbcf4c
   DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
   JOBS: '2'
   HOMEBREW_NO_AUTO_UPDATE: '1'
@@ -48,7 +48,8 @@ jobs:
           python-version: '3.12'
       - name: Install package build tools
         run: brew install pkgconf
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: media-cache
         with:
           path: |
             ~/Library/Caches/tvbox-ffmpeg/*/FFmpeg.xcframework
@@ -60,6 +61,14 @@ jobs:
           set -euo pipefail
           Scripts/build-apple-ffmpeg.sh 2>&1 | tee build/ci-ffmpeg.log
           Scripts/build-apple-libass.sh 2>&1 | tee build/ci-libass.log
+      - name: Cache successfully built media dependencies
+        if: steps.media-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/Library/Caches/tvbox-ffmpeg/*/FFmpeg.xcframework
+            ~/Library/Caches/tvbox-libass/*/LibASS.xcframework
+          key: apple-media-xcode27.2-${{ hashFiles('Scripts/build-apple-ffmpeg.sh', 'Scripts/build-apple-libass.sh') }}
       - name: Run complete default Swift package test suite
         shell: bash
         run: |
